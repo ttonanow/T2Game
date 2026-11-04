@@ -206,3 +206,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   100% { transform: translate(var(--drift), -75vh) scale(1); opacity: 0; }
 }
 @media (prefers-reduced-motion: reduce) { .fly { animation-duration: 1.5s; } }
+
+/* 봇 */
+.bot-tag { margin-left: 6px; font-size: 10px; font-weight: 800; color: #475569; background: #e2e8f0; padding: 1px 6px; border-radius: 6px; letter-spacing: .04em; }
+.bot-controls .tab:disabled { opacity: 1; cursor: default; }
+.bot-board { position: absolute; inset: 12px; display: grid; place-items: center; text-align: center; pointer-events: none; }
+.bot-board .hint { font-size: 44px; font-weight: 800; letter-spacing: .2em; }
+.board-card { position: relative; }

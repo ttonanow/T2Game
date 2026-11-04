@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Avatar } from '../App'
+import { LEVELS, MAX_BOTS, isBot, makeBots } from '../lib/bots'
 
 export function RoomHeader({ title, code, room }) {
   const [copied, setCopied] = useState(false)
@@ -64,8 +65,8 @@ export function RoomHeader({ title, code, room }) {
   )
 }
 
-export function PlayerList({ room, scores = {}, highlight = {}, meId }) {
-  const sorted = [...room.players].sort((a, b) => (scores[b.id] || 0) - (scores[a.id] || 0))
+export function PlayerList({ room, players, scores = {}, highlight = {}, meId }) {
+  const sorted = [...(players || room.players)].sort((a, b) => (scores[b.id] || 0) - (scores[a.id] || 0))
   return (
     <ul className="players">
       {sorted.map((p) => (
@@ -74,6 +75,7 @@ export function PlayerList({ room, scores = {}, highlight = {}, meId }) {
           <span className="grow ellipsis">
             {p.nickname}
             {p.id === room.hostId && <span className="host-tag">방장</span>}
+            {isBot(p.id) && <span className="bot-tag">BOT</span>}
           </span>
           {highlight[p.id] && <span className="small">{highlight[p.id]}</span>}
           <b>{scores[p.id] || 0}</b>
@@ -83,19 +85,47 @@ export function PlayerList({ room, scores = {}, highlight = {}, meId }) {
   )
 }
 
-export function Lobby({ room, onStart, minPlayers = 1, hint }) {
+export function Lobby({ room, onStart, minPlayers = 1, hint, count }) {
+  const n = count ?? room.players.length
   return (
     <div className="card stack center-text">
       <div className="big-emoji">👋</div>
-      <h3>팀원을 기다리는 중 ({room.players.length}명)</h3>
+      <h3>팀원을 기다리는 중 ({n}명)</h3>
       <p className="muted small">초대 링크를 복사해서 공유하세요. {hint}</p>
       {room.isHost ? (
-        <button className="btn primary lg" disabled={room.players.length < minPlayers} onClick={onStart}>
-          {room.players.length < minPlayers ? `최소 ${minPlayers}명 필요` : '게임 시작'}
+        <button className="btn primary lg" disabled={n < minPlayers} onClick={onStart}>
+          {n < minPlayers ? `최소 ${minPlayers}명 필요 (봇 추가 가능)` : '게임 시작'}
         </button>
       ) : (
         <p className="muted">방장이 시작하면 바로 시작돼요.</p>
       )}
+    </div>
+  )
+}
+
+/** 대기실: 봇 추가/삭제 + 난이도 선택 (방장만 조작) */
+export function BotControls({ room }) {
+  const { state, setState, isHost } = room
+  const bots = state.bots || []
+  const level = state.botLevel || 'normal'
+  return (
+    <div className="card stack bot-controls">
+      <div className="row between wrap">
+        <h4>🤖 봇과 함께하기</h4>
+        <span className="muted small">혼자서도 테스트할 수 있어요 · 봇과 한 게임은 랭킹에 반영되지 않아요</span>
+      </div>
+      <div className="row wrap">
+        <span className="small">난이도</span>
+        <div className="tabs">
+          {Object.entries(LEVELS).map(([k, v]) => (
+            <button key={k} className={'tab' + (level === k ? ' active' : '')} disabled={!isHost} onClick={() => setState((s) => ({ ...s, botLevel: k }))}>{v.label}</button>
+          ))}
+        </div>
+        <span className="sep" />
+        <span className="small">봇 {bots.length}명</span>
+        <button className="btn sm" disabled={!isHost || bots.length === 0} onClick={() => setState((s) => ({ ...s, bots: (s.bots || []).slice(0, -1) }))}>−</button>
+        <button className="btn sm" disabled={!isHost || bots.length >= MAX_BOTS} onClick={() => setState((s) => ({ ...s, bots: makeBots(s.bots || [], 1) }))}>+</button>
+      </div>
     </div>
   )
 }
@@ -118,13 +148,14 @@ export function ScoreRules({ rules, compact }) {
 const EMOJIS = ['👍', '😂', '😮', '👏', '🔥', '❤️', '🤔', '😭']
 
 /** 팀즈처럼 화면 위로 날아가는 이모지 반응 (방 안 모두에게 보임) */
-export function Reactions({ room }) {
+export function Reactions({ room, players }) {
   const [flying, setFlying] = useState([])
   const last = useRef(0)
 
   room.on('react', (d, from) => {
     if (!EMOJIS.includes(d?.emoji)) return
-    const p = room.players.find((x) => x.id === from)
+    const who = d.as || from
+    const p = (players || room.players).find((x) => x.id === who)
     const item = { id: Math.random(), emoji: d.emoji, name: p?.nickname || '', x: 8 + Math.random() * 84, drift: (Math.random() - 0.5) * 80 }
     setFlying((f) => [...f.slice(-30), item])
     setTimeout(() => setFlying((f) => f.filter((i) => i.id !== item.id)), 3200)

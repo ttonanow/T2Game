@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useParams, useSearchParams } from 'react-router-dom'
 import { useRoom } from '../lib/useRoom'
 import { saveScore, shuffle } from '../lib/supabase'
 import { useLocalDeadline, useNow } from '../lib/clock'
-import { Countdown, Lobby, PlayerList, Reactions, RoomHeader, ScoreRules } from './RoomShell'
+import { BotControls, Countdown, Lobby, PlayerList, Reactions, RoomHeader, ScoreRules } from './RoomShell'
+import { BOT_CHAT, BOT_EMOJIS, DRAW_BOT, chosung, isBot, makeBots, pick, rand } from '../lib/bots'
 import { Results } from './Quiz'
 
 const ROUND_TIME = 80000
@@ -22,7 +23,7 @@ const WORDS = [
   '열쇠', '자물쇠', '전구', '연필', '가위', '택배', '엘리베이터', '회의', '야근', '출근',
 ]
 
-const INITIAL = { phase: 'lobby', round: 0, order: [], drawerId: null, word: '', wordVer: 0, rerolled: false, winner: null, scores: {}, duration: 0, gameId: null }
+const INITIAL = { bots: [], botLevel: 'normal', phase: 'lobby', round: 0, order: [], drawerId: null, word: '', wordVer: 0, rerolled: false, winner: null, scores: {}, duration: 0, gameId: null }
 
 const norm = (s) => s.replace(/\s+/g, '').toLowerCase()
 
@@ -57,18 +58,18 @@ export default function Drawing({ me }) {
   const pushChat = (m) => setChat((c) => [...c.slice(-80), { ...m, key: Math.random() }])
   useEffect(() => { chatEnd.current?.scrollIntoView({ block: 'nearest' }) }, [chat])
 
-  const byId = Object.fromEntries(room.players.map((p) => [p.id, p]))
-  const playersRef = useRef(room.players)
-  playersRef.current = room.players
+  const allPlayers = [...room.players, ...(state.bots || [])]
+  const byId = Object.fromEntries(allPlayers.map((p) => [p.id, p]))
+  const playersRef = useRef(allPlayers)
+  playersRef.current = allPlayers
+  const botDrawing = state.phase === 'drawing' && isBot(state.drawerId)
 
   room.on('chat', (m) => pushChat(m))
 
-  // ── 호스트: 채팅/정답 판정
-  room.on('guess', (data, from) => {
-    if (!isHost) return
+  // ── 호스트: 채팅/정답 판정 (사람/봇 공통)
+  const handleGuess = (from, text, elapsed) => {
     const s = stateRef.current
     const nickname = playersRef.current.find((p) => p.id === from)?.nickname || '?'
-    const text = data.text
     if (s.phase === 'drawing' && from === s.drawerId) {
       // 그리는 사람도 채팅 가능. 단, 정답이 들어간 말은 막기
       if (norm(text).includes(norm(s.word))) room.send('chat', { kind: 'system', text: '🙊 그리는 사람의 메시지에 정답이 들어 있어서 가렸어요' })
@@ -76,14 +77,64 @@ export default function Drawing({ me }) {
       return
     }
     if (s.phase === 'drawing' && norm(text) === norm(s.word)) {
-      const points = guessPoints(data.elapsed)
+      const points = guessPoints(elapsed)
       const scores = { ...s.scores, [from]: (s.scores[from] || 0) + points, [s.drawerId]: (s.scores[s.drawerId] || 0) + DRAWER_BONUS }
       room.send('chat', { kind: 'correct', from, nickname, text, points, drawerName: playersRef.current.find((p) => p.id === s.drawerId)?.nickname })
       setState({ ...s, scores, winner: { id: from, points }, phase: 'reveal', duration: REVEAL_TIME })
       return
     }
     room.send('chat', { kind: 'guess', from, nickname, text })
+  }
+  const guessRef = useRef(handleGuess)
+  guessRef.current = handleGuess
+
+  room.on('guess', (data, from) => {
+    if (isHost) handleGuess(from, data.text, data.elapsed)
   })
+
+  // ── 호스트: 봇 행동 (추측·채팅·이모지, 봇이 그릴 차례면 초성 힌트)
+  useEffect(() => {
+    if (!isHost) return
+    const s = stateRef.current
+    const bots = s.bots || []
+    if (!bots.length || s.phase !== 'drawing') return
+    const cfg = DRAW_BOT[s.botLevel] || DRAW_BOT.normal
+    const timers = []
+    const at = (ms, fn) => timers.push(setTimeout(fn, ms))
+    const drawer = playersRef.current.find((p) => p.id === s.drawerId)
+    if (isBot(s.drawerId)) {
+      at(800, () => room.send('chat', { kind: 'system', text: `🤖 ${drawer?.nickname}은 그림 대신 힌트를 줘요 · 초성: ${chosung(s.word)}` }))
+      at(ROUND_TIME * 0.45, () => room.send('chat', { kind: 'system', text: `🤖 추가 힌트: 첫 글자는 "${s.word[0]}"` }))
+    }
+    for (const b of bots) {
+      if (b.id === s.drawerId) continue
+      // 오답 1~2번
+      const wrongs = Math.random() < 0.5 ? 1 : 2
+      for (let i = 0; i < wrongs; i++) {
+        at(rand(5000, cfg.min), () => guessRef.current(b.id, pick(WORDS.filter((w) => w !== s.word)), 0))
+      }
+      if (Math.random() < 0.3) at(rand(3000, 20000), () => guessRef.current(b.id, pick(BOT_CHAT), 0))
+      if (Math.random() < 0.4) at(rand(2000, 30000), () => room.send('react', { emoji: pick(BOT_EMOJIS), as: b.id }))
+      // 정답
+      if (Math.random() < cfg.p) {
+        const ms = rand(cfg.min, Math.min(cfg.max, ROUND_TIME - 1000))
+        at(ms, () => guessRef.current(b.id, s.word, ms))
+      }
+    }
+    return () => timers.forEach(clearTimeout)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isHost, state.phase, state.round, state.wordVer, state.gameId])
+
+  // 연습 모드로 들어오면 봇 자동 추가 (?bots=3)
+  const [params] = useSearchParams()
+  const autoBots = useRef(false)
+  useEffect(() => {
+    const n = Number(params.get('bots'))
+    if (isHost && n && !autoBots.current && state.phase === 'lobby') {
+      autoBots.current = true
+      setState((st) => ({ ...st, bots: makeBots(st.bots || [], n) }))
+    }
+  }, [isHost, params, state.phase, setState])
 
   // ── 호스트: 단어 새로고침 (그리는 사람, 라운드당 1회)
   room.on('reroll', (_d, from) => {
@@ -138,15 +189,16 @@ export default function Drawing({ me }) {
     if (state.phase === 'end' && state.gameId && savedFor.current !== state.gameId) {
       savedFor.current = state.gameId
       const mine = state.scores[me.id]
-      if (mine !== undefined) saveScore(me.id, 'drawing', mine, { room: code, players: Object.keys(state.scores).length })
+      // 봇과 한 연습 게임은 랭킹에 저장하지 않음
+      if (mine !== undefined && !(state.bots || []).length) saveScore(me.id, 'drawing', mine, { room: code, players: Object.keys(state.scores).length })
     }
   }, [state.phase, state.gameId, state.scores, me.id, code])
 
   const start = () => {
-    const order = shuffle(room.players.map((p) => p.id))
+    const order = shuffle(playersRef.current.map((p) => p.id))
     const scores = Object.fromEntries(order.map((id) => [id, 0]))
     const word = pickWord([])
-    setState({ phase: 'drawing', round: 0, order, drawerId: order[0], word, used: [word], rerolled: false, wordVer: 0, winner: null, scores, duration: ROUND_TIME, gameId: Date.now() })
+    setState((st) => ({ ...st, phase: 'drawing', round: 0, order, drawerId: order[0], word, used: [word], rerolled: false, wordVer: 0, winner: null, scores, duration: ROUND_TIME, gameId: Date.now() }))
     setChat([])
   }
 
@@ -174,12 +226,13 @@ export default function Drawing({ me }) {
 
       {state.phase === 'lobby' && (
         <>
-          <Lobby room={room} onStart={start} minPlayers={2} hint="모든 사람이 한 번씩 그려요." />
+          <Lobby room={room} count={allPlayers.length} onStart={start} minPlayers={2} hint="모든 사람이 한 번씩 그려요. (봇 차례엔 초성 힌트)" />
+          <BotControls room={room} />
           <ScoreRules rules={DRAW_RULES} />
         </>
       )}
 
-      {state.phase === 'end' && <Results scores={state.scores} players={room.players} meId={me.id} onRestart={isHost ? start : null} unit="점" />}
+      {state.phase === 'end' && <Results scores={state.scores} players={allPlayers} practice={(state.bots || []).length > 0} meId={me.id} onRestart={isHost ? start : null} unit="점" />}
 
       {(state.phase === 'drawing' || state.phase === 'reveal') && (
         <div className="room-layout draw">
@@ -199,12 +252,12 @@ export default function Drawing({ me }) {
               </div>
               {state.phase === 'drawing' ? <Countdown endsAt={endsAt} /> : <span className="pill">정답 공개</span>}
             </div>
-            <Board room={room} me={me} isDrawer={isDrawer} roundKey={roundKey} />
-            <Reactions room={room} />
+            <Board room={room} me={me} isDrawer={isDrawer} roundKey={roundKey} botHint={botDrawing ? chosung(state.word) : null} botName={byId[state.drawerId]?.nickname} />
+            <Reactions room={room} players={allPlayers} />
           </div>
           <aside className="stack">
             <div className="card">
-              <PlayerList room={room} scores={state.scores} highlight={hl} meId={me.id} />
+              <PlayerList room={room} players={allPlayers} scores={state.scores} highlight={hl} meId={me.id} />
             </div>
             <div className="card chat">
               <div className="chat-log">
@@ -240,7 +293,7 @@ export default function Drawing({ me }) {
       )}
 
       {state.phase === 'lobby' && (
-        <div className="card"><h4>참가자</h4><PlayerList room={room} meId={me.id} /></div>
+        <div className="card"><h4>참가자</h4><PlayerList room={room} players={allPlayers} meId={me.id} /></div>
       )}
     </div>
   )
@@ -252,7 +305,7 @@ function pickWord(used = []) {
 }
 
 /** 실시간 그림판 */
-function Board({ room, me, isDrawer, roundKey }) {
+function Board({ room, me, isDrawer, roundKey, botHint, botName }) {
   const canvasRef = useRef(null)
   const [color, setColor] = useState(COLORS[0])
   const [size, setSize] = useState(SIZES[0])
@@ -342,6 +395,16 @@ function Board({ room, me, isDrawer, roundKey }) {
         onPointerUp={up}
         onPointerCancel={up}
       />
+      {botHint && (
+        <div className="bot-board">
+          <div>
+            <div className="big-emoji">🤖</div>
+            <p className="muted">{botName}은 그림을 못 그려서 초성 힌트를 줘요</p>
+            <div className="hint">{botHint}</div>
+            <p className="muted small">채팅창에 정답을 입력해 보세요</p>
+          </div>
+        </div>
+      )}
       {isDrawer && (
         <div className="row wrap tools">
           {COLORS.map((c) => (

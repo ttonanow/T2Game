@@ -3,7 +3,7 @@ import { useParams } from 'react-router-dom'
 import { useRoom } from '../lib/useRoom'
 import { saveScore, shuffle } from '../lib/supabase'
 import { useLocalDeadline, useNow } from '../lib/clock'
-import { Countdown, Lobby, PlayerList, RoomHeader } from './RoomShell'
+import { Countdown, Lobby, PlayerList, Reactions, RoomHeader, ScoreRules } from './RoomShell'
 import { Results } from './Quiz'
 
 const ROUND_TIME = 80000
@@ -22,20 +22,33 @@ const WORDS = [
   '열쇠', '자물쇠', '전구', '연필', '가위', '택배', '엘리베이터', '회의', '야근', '출근',
 ]
 
-const INITIAL = { phase: 'lobby', round: 0, order: [], drawerId: null, word: '', guessed: {}, scores: {}, duration: 0, gameId: null }
+const INITIAL = { phase: 'lobby', round: 0, order: [], drawerId: null, word: '', wordVer: 0, rerolled: false, winner: null, scores: {}, duration: 0, gameId: null }
 
 const norm = (s) => s.replace(/\s+/g, '').toLowerCase()
+
+// 점수 계산 (화면에 안내되는 규칙과 동일)
+const GUESS_MAX = 300
+const GUESS_MIN = 50
+const DRAWER_BONUS = 100
+const guessPoints = (elapsed) => Math.max(GUESS_MIN, Math.round(GUESS_MAX * Math.max(0, 1 - elapsed / ROUND_TIME)))
+
+const DRAW_RULES = [
+  `가장 먼저 맞힌 사람: 빨리 맞힐수록 높은 점수 (최대 ${GUESS_MAX}점 → 최소 ${GUESS_MIN}점)`,
+  `그린 사람: 누군가 맞히면 +${DRAWER_BONUS}점`,
+  '한 명이 맞히면 바로 다음 문제로 넘어가요',
+  `제한 시간 ${ROUND_TIME / 1000}초 · 그리는 사람은 단어를 1번 바꿀 수 있어요`,
+]
 
 export default function Drawing({ me }) {
   const { code } = useParams()
   const room = useRoom('draw', code.toUpperCase(), me, INITIAL)
   const { state, isHost, setState, stateRef } = room
   useNow(250)
-  const roundKey = `${state.gameId}-${state.round}`
+  const turnKey = `${state.gameId}-${state.round}`
+  const roundKey = `${turnKey}-${state.wordVer}` // 단어를 바꾸면 그림판·타이머 초기화
   const endsAt = useLocalDeadline(`${roundKey}-${state.phase}`, state.duration)
   const isDrawer = state.phase === 'drawing' && state.drawerId === me.id
-  const iGuessed = !!state.guessed[me.id]
-  const canSeeWord = isDrawer || iGuessed || state.phase === 'reveal'
+  const canSeeWord = isDrawer || state.phase === 'reveal'
 
   // ── 채팅
   const [chat, setChat] = useState([])
@@ -47,39 +60,39 @@ export default function Drawing({ me }) {
   const byId = Object.fromEntries(room.players.map((p) => [p.id, p]))
   const playersRef = useRef(room.players)
   playersRef.current = room.players
-  const stRef = useRef(state)
-  stRef.current = state
 
-  room.on('chat', (m) => {
-    const s = stRef.current
-    // 이미 맞힌 사람들끼리의 대화는 출제자/정답자에게만 보임
-    if (m.kind === 'secret' && !(s.drawerId === me.id || s.guessed[me.id] || m.from === me.id)) return
-    pushChat(m)
-  })
+  room.on('chat', (m) => pushChat(m))
 
-  // ── 호스트: 추측 판정
+  // ── 호스트: 채팅/정답 판정
   room.on('guess', (data, from) => {
     if (!isHost) return
     const s = stateRef.current
-    const who = room.players.find((p) => p.id === from)
-    const nickname = who?.nickname || '?'
-    if (s.phase !== 'drawing' || from === s.drawerId || s.guessed[from]) {
-      room.send('chat', { kind: s.phase === 'drawing' ? 'secret' : 'guess', from, nickname, text: data.text })
+    const nickname = playersRef.current.find((p) => p.id === from)?.nickname || '?'
+    const text = data.text
+    if (s.phase === 'drawing' && from === s.drawerId) {
+      // 그리는 사람도 채팅 가능. 단, 정답이 들어간 말은 막기
+      if (norm(text).includes(norm(s.word))) room.send('chat', { kind: 'system', text: '🙊 그리는 사람의 메시지에 정답이 들어 있어서 가렸어요' })
+      else room.send('chat', { kind: 'guess', from, nickname, text })
       return
     }
-    if (norm(data.text) === norm(s.word)) {
-      const remaining = Math.max(0, 1 - data.elapsed / ROUND_TIME)
-      const order = Object.keys(s.guessed).length
-      const points = Math.max(50, Math.round(300 * remaining) - order * 20)
-      const guessed = { ...s.guessed, [from]: points }
-      const scores = { ...s.scores, [from]: (s.scores[from] || 0) + points, [s.drawerId]: (s.scores[s.drawerId] || 0) + 50 }
-      const others = room.players.filter((p) => p.id !== s.drawerId)
-      const allIn = others.length > 0 && others.every((p) => guessed[p.id])
-      setState({ ...s, guessed, scores, ...(allIn ? { phase: 'reveal', duration: REVEAL_TIME } : {}) })
-      room.send('chat', { kind: 'system', text: `🎉 ${nickname}님 정답! +${points}` })
-    } else {
-      room.send('chat', { kind: 'guess', from, nickname, text: data.text })
+    if (s.phase === 'drawing' && norm(text) === norm(s.word)) {
+      const points = guessPoints(data.elapsed)
+      const scores = { ...s.scores, [from]: (s.scores[from] || 0) + points, [s.drawerId]: (s.scores[s.drawerId] || 0) + DRAWER_BONUS }
+      room.send('chat', { kind: 'correct', from, nickname, text, points, drawerName: playersRef.current.find((p) => p.id === s.drawerId)?.nickname })
+      setState({ ...s, scores, winner: { id: from, points }, phase: 'reveal', duration: REVEAL_TIME })
+      return
     }
+    room.send('chat', { kind: 'guess', from, nickname, text })
+  })
+
+  // ── 호스트: 단어 새로고침 (그리는 사람, 라운드당 1회)
+  room.on('reroll', (_d, from) => {
+    if (!isHost) return
+    const s = stateRef.current
+    if (s.phase !== 'drawing' || from !== s.drawerId || s.rerolled) return
+    const word = pickWord(s.used)
+    setState({ ...s, word, used: [...(s.used || []), word], rerolled: true, wordVer: (s.wordVer || 0) + 1, duration: ROUND_TIME })
+    room.send('chat', { kind: 'system', text: '🔄 그리는 사람이 단어를 바꿨어요. 타이머가 다시 시작돼요' })
   })
 
   // ── 호스트: 라운드 진행
@@ -88,7 +101,7 @@ export default function Drawing({ me }) {
     if (state.phase === 'drawing') {
       const t = setTimeout(() => {
         const s = stateRef.current
-        if (s.phase === 'drawing' && s.round === state.round) setState({ ...s, phase: 'reveal', duration: REVEAL_TIME })
+        if (s.phase === 'drawing' && s.round === state.round && s.wordVer === state.wordVer) setState({ ...s, winner: null, phase: 'reveal', duration: REVEAL_TIME })
       }, ROUND_TIME + 500)
       return () => clearTimeout(t)
     }
@@ -102,12 +115,12 @@ export default function Drawing({ me }) {
         if (next >= s.order.length) setState({ ...s, phase: 'end', duration: 0 })
         else {
           const word = pickWord(s.used)
-          setState({ ...s, phase: 'drawing', round: next, drawerId: s.order[next], word, used: [...(s.used || []), word], guessed: {}, duration: ROUND_TIME })
+          setState({ ...s, phase: 'drawing', round: next, drawerId: s.order[next], word, used: [...(s.used || []), word], rerolled: false, wordVer: 0, winner: null, duration: ROUND_TIME })
         }
       }, REVEAL_TIME)
       return () => clearTimeout(t)
     }
-  }, [isHost, state.phase, state.round, state.gameId, setState, stateRef])
+  }, [isHost, state.phase, state.round, state.wordVer, state.gameId, setState, stateRef])
 
   // 라운드 시작/공개 알림
   useEffect(() => {
@@ -115,9 +128,9 @@ export default function Drawing({ me }) {
       const d = byId[state.drawerId]
       pushChat({ kind: 'system', text: `✏️ 라운드 ${state.round + 1}: ${d?.nickname || '?'}님이 그려요` })
     }
-    if (state.phase === 'reveal') pushChat({ kind: 'system', text: `정답은 "${state.word}" 였어요!` })
+    if (state.phase === 'reveal') pushChat({ kind: 'system', text: state.winner ? `정답은 "${state.word}"! 곧 다음 문제로 넘어가요` : `⏰ 시간 초과! 정답은 "${state.word}" 였어요` })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roundKey, state.phase])
+  }, [turnKey, state.phase])
 
   // ── 게임 종료 시 내 점수 저장
   const savedFor = useRef(null)
@@ -133,7 +146,7 @@ export default function Drawing({ me }) {
     const order = shuffle(room.players.map((p) => p.id))
     const scores = Object.fromEntries(order.map((id) => [id, 0]))
     const word = pickWord([])
-    setState({ phase: 'drawing', round: 0, order, drawerId: order[0], word, used: [word], guessed: {}, scores, duration: ROUND_TIME, gameId: Date.now() })
+    setState({ phase: 'drawing', round: 0, order, drawerId: order[0], word, used: [word], rerolled: false, wordVer: 0, winner: null, scores, duration: ROUND_TIME, gameId: Date.now() })
     setChat([])
   }
 
@@ -148,14 +161,23 @@ export default function Drawing({ me }) {
     setText('')
   }
 
-  const hl = Object.fromEntries(Object.entries(state.guessed).map(([id, p]) => [id, `✓ +${p}`]))
+  const hl = {}
   if (state.drawerId && state.phase === 'drawing') hl[state.drawerId] = '✏️'
+  if (state.phase === 'reveal' && state.winner) {
+    hl[state.winner.id] = `✓ +${state.winner.points}`
+    hl[state.drawerId] = `✏️ +${DRAWER_BONUS}`
+  }
 
   return (
     <div className="stack">
       <RoomHeader title="🎨 그림 맞추기" code={code.toUpperCase()} room={room} />
 
-      {state.phase === 'lobby' && <Lobby room={room} onStart={start} minPlayers={2} hint="모든 사람이 한 번씩 그려요." />}
+      {state.phase === 'lobby' && (
+        <>
+          <Lobby room={room} onStart={start} minPlayers={2} hint="모든 사람이 한 번씩 그려요." />
+          <ScoreRules rules={DRAW_RULES} />
+        </>
+      )}
 
       {state.phase === 'end' && <Results scores={state.scores} players={room.players} meId={me.id} onRestart={isHost ? start : null} unit="점" />}
 
@@ -164,13 +186,21 @@ export default function Drawing({ me }) {
           <div className="stack">
             <div className="card row between wrap">
               <span className="pill">라운드 {state.round + 1} / {state.order.length}</span>
-              <div className="word">
-                {canSeeWord ? state.word : state.word.split('').map(() => '＿').join(' ')}
-                {!canSeeWord && <span className="muted small"> ({state.word.length}글자)</span>}
+              <div className="row">
+                <div className="word">
+                  {canSeeWord ? state.word : state.word.split('').map(() => '＿').join(' ')}
+                  {!canSeeWord && <span className="muted small"> ({state.word.length}글자)</span>}
+                </div>
+                {isDrawer && (
+                  <button className="btn sm" disabled={state.rerolled} onClick={() => room.send('reroll', {})} title="라운드당 1번">
+                    🔄 {state.rerolled ? '변경 완료' : '다른 단어 (1회)'}
+                  </button>
+                )}
               </div>
               {state.phase === 'drawing' ? <Countdown endsAt={endsAt} /> : <span className="pill">정답 공개</span>}
             </div>
             <Board room={room} me={me} isDrawer={isDrawer} roundKey={roundKey} />
+            <Reactions room={room} />
           </div>
           <aside className="stack">
             <div className="card">
@@ -180,7 +210,15 @@ export default function Drawing({ me }) {
               <div className="chat-log">
                 {chat.map((m) => (
                   <div key={m.key} className={'chat-line ' + m.kind}>
-                    {m.kind === 'system' ? m.text : (<><b style={{ color: byId[m.from]?.color }}>{m.nickname}</b> {m.text}</>)}
+                    {m.kind === 'system' && m.text}
+                    {m.kind === 'guess' && (<><b style={{ color: byId[m.from]?.color }}>{m.nickname}</b> {m.text}</>)}
+                    {m.kind === 'correct' && (
+                      <>
+                        <span className="correct-tag">✅ 정답</span>
+                        <b style={{ color: byId[m.from]?.color }}>{m.nickname}</b> {m.text}
+                        <span className="correct-pts">+{m.points}{m.drawerName ? ` · ${m.drawerName} +${DRAWER_BONUS}` : ''}</span>
+                      </>
+                    )}
                   </div>
                 ))}
                 <div ref={chatEnd} />
@@ -188,15 +226,15 @@ export default function Drawing({ me }) {
               <form className="row" onSubmit={sendGuess}>
                 <input
                   className="input grow"
-                  placeholder={isDrawer ? '그리는 중엔 입력할 수 없어요' : iGuessed ? '정답자끼리 채팅' : '정답을 입력하세요'}
-                  disabled={isDrawer}
+                  placeholder={isDrawer ? '채팅 (정답 단어는 가려져요)' : '정답이나 채팅을 입력하세요'}
                   value={text}
                   onChange={(e) => setText(e.target.value)}
                   maxLength={40}
                 />
-                <button className="btn" disabled={isDrawer}>전송</button>
+                <button className="btn">전송</button>
               </form>
             </div>
+            <ScoreRules rules={DRAW_RULES} compact />
           </aside>
         </div>
       )}

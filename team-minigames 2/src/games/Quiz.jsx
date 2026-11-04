@@ -4,13 +4,19 @@ import { useRoom } from '../lib/useRoom'
 import { saveScore, shuffle } from '../lib/supabase'
 import { useLocalDeadline, useNow } from '../lib/clock'
 import { QUIZ_BANK } from './quizBank'
-import { Countdown, Lobby, PlayerList, RoomHeader } from './RoomShell'
+import { Countdown, Lobby, PlayerList, Reactions, RoomHeader, ScoreRules } from './RoomShell'
 import { Avatar } from '../App'
 
 const QUESTIONS = 10
 const Q_TIME = 15000
 const REVEAL_TIME = 4000
 const LABELS = ['A', 'B', 'C', 'D']
+
+const QUIZ_RULES = [
+  '정답: 기본 500점 + 속도 보너스 최대 500점 (빨리 맞힐수록 높음)',
+  '오답·시간 초과: 0점',
+  `문제당 ${Q_TIME / 1000}초 · 총 ${QUESTIONS}문제 · 모두 답하면 바로 정답 공개`,
+]
 
 const INITIAL = { phase: 'lobby', qIndex: 0, questions: [], scores: {}, answers: {}, duration: 0, gameId: null }
 
@@ -100,6 +106,7 @@ export default function Quiz({ me }) {
       <div className="room-layout">
         <div className="stack">
           {state.phase === 'lobby' && <Lobby room={room} onStart={start} hint={`문제 ${QUESTIONS}개, 문제당 ${Q_TIME / 1000}초`} />}
+          {state.phase === 'lobby' && <ScoreRules rules={QUIZ_RULES} />}
 
           {(state.phase === 'question' || state.phase === 'reveal') && q && (
             <div className="card stack">
@@ -131,11 +138,16 @@ export default function Quiz({ me }) {
             </div>
           )}
 
+          {state.phase !== 'lobby' && <Reactions room={room} />}
+
           {state.phase === 'end' && <Results scores={state.scores} players={room.players} meId={me.id} onRestart={room.isHost ? start : null} unit="점" />}
         </div>
-        <aside className="card">
-          <h4>참가자</h4>
-          <PlayerList room={room} scores={state.scores} highlight={answeredHl} meId={me.id} />
+        <aside className="stack">
+          <div className="card">
+            <h4>참가자</h4>
+            <PlayerList room={room} scores={state.scores} highlight={answeredHl} meId={me.id} />
+          </div>
+          {state.phase !== 'lobby' && <ScoreRules rules={QUIZ_RULES} compact />}
         </aside>
       </div>
     </div>
